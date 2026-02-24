@@ -8,6 +8,7 @@ output_sectors/*
 output_sectors_full/*
 wandb/
 notebooks/*
+!notebooks/sector_analysis.ipynb
 # except keep the folders
 !raw/.gitkeep
 !output-scratch/.gitkeep
