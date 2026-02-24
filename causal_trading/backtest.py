@@ -3,6 +3,12 @@ Backtesting engine for both portfolio strategies and pair trading.
 
 Simple, transparent vectorized backtest — no external dependencies.
 Computes returns, drawdowns, Sharpe, and other standard metrics.
+
+Design principles:
+- Walk-forward only: weights computed from past data, applied to future
+- No look-ahead bias: signals at t use data up to t-1
+- Transaction costs: proportional to turnover on rebalance days
+- Weight drift: between rebalances, weights drift with returns (realistic)
 """
 import numpy as np
 import pandas as pd
@@ -77,6 +83,9 @@ class BacktestResult:
         else:
             self.metrics["sortino"] = 0.0
 
+        # Number of trades (for pairs)
+        self.metrics["n_days"] = total_days
+
     def summary(self) -> str:
         """Formatted summary string."""
         lines = [f"\n{'=' * 60}", f"  {self.name}", f"{'=' * 60}"]
@@ -103,40 +112,38 @@ def backtest_portfolio(
     """
     Backtest a portfolio strategy with periodic rebalancing.
 
-    Walk-forward:
-    1. At each rebalance date, use historical data to estimate causal structure
-    2. Optimize portfolio weights
-    3. Hold until next rebalance
-    4. Account for transaction costs
+    Walk-forward design:
+    1. At each rebalance date, use ONLY historical data to estimate causal structure
+    2. Optimize portfolio weights from that historical window
+    3. Apply weights to NEXT period's returns (no look-ahead)
+    4. Account for transaction costs proportional to turnover
+    5. Between rebalances, weights drift naturally with asset returns
     """
     result = BacktestResult(f"Portfolio ({port_cfg.method})")
 
     T = len(returns)
     train_end = int(T * bt_cfg.train_fraction)
     rebal_interval = port_cfg.rebalance_days
-    lookback = min(252, train_end)  # estimation window
+    lookback = min(252, train_end)
 
-    # Out-of-sample period
     oos_returns = returns.iloc[train_end:]
-    oos_prices = prices.iloc[train_end:]
 
     if len(oos_returns) < 10:
         print("  Not enough out-of-sample data for portfolio backtest")
         return result
 
-    # Generate rebalance dates
     rebal_indices = list(range(0, len(oos_returns), rebal_interval))
     if not rebal_indices:
         rebal_indices = [0]
 
     weights_history = []
     current_weights = None
-
-    # Portfolio returns series
     port_returns = pd.Series(0.0, index=oos_returns.index)
 
+    # Only run causal analysis for methods that need it
+    needs_causal = port_cfg.method == "causal_weighted"
+
     for idx in rebal_indices:
-        # Get estimation window (look back from this point in the full returns)
         est_end = train_end + idx
         est_start = max(0, est_end - lookback)
         est_returns = returns.iloc[est_start:est_end]
@@ -144,19 +151,21 @@ def backtest_portfolio(
         if len(est_returns) < 30:
             continue
 
-        # Run causal analysis on estimation window
-        causal_results = run_causal_analysis(est_returns, causal_cfg)
-        # Use first available method for portfolio construction
-        causal_result = next(iter(causal_results.values())) if causal_results else None
+        # Only run expensive causal analysis when the method requires it
+        causal_result = None
+        if needs_causal:
+            causal_results = run_causal_analysis(est_returns, causal_cfg)
+            causal_result = next(iter(causal_results.values())) if causal_results else None
 
-        # Optimize weights
         new_weights = optimize_portfolio(est_returns, causal_result, port_cfg)
         new_weights = new_weights.clip(lower=0)
         new_weights = new_weights / (new_weights.sum() + 1e-12)
 
-        # Transaction costs
+        # Transaction costs: proportional to turnover (both buying and selling)
         if current_weights is not None:
-            turnover = (new_weights - current_weights).abs().sum()
+            # Align indices for turnover calc (handles potential mismatches)
+            aligned_old = current_weights.reindex(new_weights.index, fill_value=0)
+            turnover = (new_weights - aligned_old).abs().sum()
             tc = turnover * bt_cfg.commission_pct
         else:
             tc = bt_cfg.commission_pct  # initial investment cost
@@ -164,18 +173,19 @@ def backtest_portfolio(
         current_weights = new_weights
         weights_history.append((oos_returns.index[idx], new_weights.copy()))
 
-        # Apply weights until next rebalance
-        next_idx = rebal_indices[rebal_indices.index(idx) + 1] if idx != rebal_indices[-1] else len(oos_returns)
-        period_returns = oos_returns.iloc[idx:next_idx]
+        # Apply weights to returns until next rebalance
+        next_rebal = rebal_indices[rebal_indices.index(idx) + 1] if idx != rebal_indices[-1] else len(oos_returns)
+        period_returns = oos_returns.iloc[idx:next_rebal]
 
         for t_offset in range(len(period_returns)):
             t_global = idx + t_offset
+            # Daily portfolio return = sum(weight_i * return_i)
             daily_ret = (period_returns.iloc[t_offset] * current_weights).sum()
             if t_offset == 0:
-                daily_ret -= tc  # deduct transaction cost on rebalance day
+                daily_ret -= tc  # deduct TC on rebalance day
             port_returns.iloc[t_global] = daily_ret
 
-            # Update weights for drift (buy-and-hold drift between rebalances)
+            # Drift weights to reflect price changes (buy-and-hold between rebalances)
             if t_offset < len(period_returns) - 1:
                 drifted = current_weights * (1 + period_returns.iloc[t_offset])
                 current_weights = drifted / (drifted.sum() + 1e-12)
@@ -204,9 +214,10 @@ def backtest_pairs(
     Backtest pair trading strategy.
 
     For each pair:
-    - Compute spread and z-scores
-    - Generate entry/exit signals
-    - Calculate P&L from spread convergence
+    - Compute spread and z-scores using rolling lookback (no future data)
+    - Generate entry/exit signals based on z-score thresholds
+    - P&L: position is set at close of signal day, applied to NEXT day's return
+    - Beta for hedge ratio is lagged by 1 day to avoid look-ahead
     """
     result = BacktestResult("Pair Trading (causal)")
 
@@ -228,28 +239,27 @@ def backtest_pairs(
         signals = generate_pair_signals(oos_prices, pair, pairs_cfg)
         all_signals[f"{pair.leader}->{pair.follower}"] = signals
 
-        # P&L from pair trading
-        # Long spread: long follower + short leader
         follower_ret = oos_prices[pair.follower].pct_change()
         leader_ret = oos_prices[pair.leader].pct_change()
         position = signals["position"]
 
-        # Spread return = position * (follower_ret - beta * leader_ret)
-        beta = signals["beta"].ffill()
+        # Use LAGGED beta to avoid look-ahead: hedge ratio known at t-1
+        beta = signals["beta"].ffill().shift(1)
+
+        # position.shift(1): decision made at t-1 close, applied to t returns
         spread_ret = position.shift(1) * (follower_ret - beta * leader_ret)
 
-        # Transaction costs on signal changes
-        trades = signals["signal"].abs()
-        tc = trades * bt_cfg.commission_pct * 2  # both legs
-        spread_ret = spread_ret - tc
+        # Transaction costs: charged when position changes
+        position_change = position.diff().abs().fillna(0)
+        tc = position_change * bt_cfg.commission_pct * 2  # both legs
 
+        spread_ret = spread_ret - tc
         pair_pnls[f"{pair.leader}->{pair.follower}"] = spread_ret
 
     if not pair_pnls:
         print("  No valid pairs for backtesting")
         return result
 
-    # Combine pair P&Ls (equal weight across pairs)
     pnl_df = pd.DataFrame(pair_pnls).fillna(0)
     combined_returns = pnl_df.mean(axis=1)
 
@@ -269,15 +279,19 @@ def backtest_equal_weight_benchmark(
     returns: pd.DataFrame,
     bt_cfg: BacktestConfig,
 ) -> BacktestResult:
-    """Simple equal-weight buy-and-hold benchmark."""
+    """
+    Equal-weight buy-and-hold benchmark.
+    Includes initial transaction cost for fair comparison.
+    """
     result = BacktestResult("Equal Weight (benchmark)")
 
     T = len(returns)
     train_end = int(T * bt_cfg.train_fraction)
     oos_returns = returns.iloc[train_end:]
 
-    n = oos_returns.shape[1]
-    port_returns = oos_returns.mean(axis=1)
+    port_returns = oos_returns.mean(axis=1).copy()
+    # Deduct initial TC on first day for fair comparison with active strategies
+    port_returns.iloc[0] -= bt_cfg.commission_pct
 
     result.returns = port_returns
     result.portfolio_value = bt_cfg.initial_capital * (1 + port_returns).cumprod()

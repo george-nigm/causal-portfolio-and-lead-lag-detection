@@ -3,6 +3,7 @@ raw/*
 cleaned/pinnacle.pkl
 output-scratch/*
 output/*
+output_sp500/*
 wandb/
 notebooks/*
 # except keep the folders
